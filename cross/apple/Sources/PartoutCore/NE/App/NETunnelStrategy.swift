@@ -402,7 +402,13 @@ private extension NETunnelStrategy {
         guard try protection() == .disabled, try !isProtected(manager) else {
             throw ProtectionError.removalRequiresDisablingProtection
         }
-        try requireUnchangedProtection(.disabled)
+        // A cached unprotected manager may now refer to a saved strict
+        // configuration. Reload before deciding that deletion is permitted.
+        try await preferences.load(manager)
+        try Task.checkCancellation()
+        guard try protection() == .disabled, try !isProtected(manager) else {
+            throw ProtectionError.removalRequiresDisablingProtection
+        }
         try await preferences.remove(manager)
         allManagers.removeValue(forKey: profileId)
     }

@@ -142,11 +142,70 @@ struct NETunnelStrategyContractTests {
 
         try await strategy.uninstall(profileId: profile.id)
 
-        #expect(await store.actions == [.loadAll, .remove(profile.id)])
+        #expect(await store.actions == [.loadAll, .load(profile.id), .remove(profile.id)])
     }
 }
 
 struct NETunnelStrategyProtectionTests {
+    @Test(arguments: [NETunnelProtection.requireVPN.rawValue, "corrupt"])
+    func removalReloadsSavedProtectionBeforeDeleting(_ marker: String) async throws {
+        let profile = try protectedProfile()
+        let manager = makeManager(profileId: profile.id, fingerprint: profile.name)
+        let store = MockTunnelPreferences(managers: [manager], protectionMarkerOnLoad: marker)
+        let strategy = try await makePreparedStrategy(profile: profile, store: store)
+
+        if marker == NETunnelProtection.requireVPN.rawValue {
+            await #expect(throws: NETunnelStrategy.ProtectionError.removalRequiresDisablingProtection) {
+                try await strategy.remove(profileId: profile.id)
+            }
+        } else {
+            await #expect(throws: NETunnelProtectionError.invalidConfiguration) {
+                try await strategy.remove(profileId: profile.id)
+            }
+        }
+        #expect(await store.actions == [.loadAll, .load(profile.id)])
+        #expect(await store.savedManagers.isEmpty)
+    }
+
+    @Test
+    func removalRechecksDevicePolicyAfterLoading() async throws {
+        let policy = MutableProtection()
+        let loadGate = PreferenceGate()
+        let profile = try protectedProfile()
+        let manager = makeManager(profileId: profile.id, fingerprint: profile.name)
+        let store = MockTunnelPreferences(managers: [manager], loadGate: loadGate)
+        let strategy = try await makePreparedStrategy(profile: profile, store: store, protection: { policy.read() })
+        let removal = Task {
+            try await strategy.remove(profileId: profile.id)
+        }
+        await loadGate.waitUntilEntered()
+        policy.set(.requireVPN)
+        await loadGate.open()
+        await #expect(throws: NETunnelStrategy.ProtectionError.removalRequiresDisablingProtection) {
+            try await removal.value
+        }
+        #expect(await store.actions == [.loadAll, .load(profile.id)])
+    }
+
+    @Test
+    func canceledRemovalNeverDeletesAfterLoading() async throws {
+        let loadGate = PreferenceGate()
+        let profile = try protectedProfile()
+        let manager = makeManager(profileId: profile.id, fingerprint: profile.name)
+        let store = MockTunnelPreferences(managers: [manager], loadGate: loadGate)
+        let strategy = try await makePreparedStrategy(profile: profile, store: store)
+        let removal = Task {
+            try await strategy.remove(profileId: profile.id)
+        }
+        await loadGate.waitUntilEntered()
+        removal.cancel()
+        await loadGate.open()
+        await #expect(throws: CancellationError.self) {
+            try await removal.value
+        }
+        #expect(await store.actions == [.loadAll, .load(profile.id)])
+    }
+
     @Test
     func policyChangeWhileLoadingRejectsSaveBeforeMutation() async throws {
         let policy = MutableProtection()
@@ -699,6 +758,7 @@ private enum PreferenceAction: Equatable, Sendable {
 private actor MockTunnelPreferences {
     private let managers: [NETunnelProviderManager]
     private let isEnabledOnLoad: Bool?
+    private let protectionMarkerOnLoad: String?
     private let loadAllGate: PreferenceGate?
     private let loadGate: PreferenceGate?
     private let saveGate: PreferenceGate?
@@ -712,6 +772,7 @@ private actor MockTunnelPreferences {
     init(
         managers: [NETunnelProviderManager] = [],
         isEnabledOnLoad: Bool? = nil,
+        protectionMarkerOnLoad: String? = nil,
         loadAllGate: PreferenceGate? = nil,
         loadGate: PreferenceGate? = nil,
         saveGate: PreferenceGate? = nil,
@@ -720,6 +781,7 @@ private actor MockTunnelPreferences {
     ) {
         self.managers = managers
         self.isEnabledOnLoad = isEnabledOnLoad
+        self.protectionMarkerOnLoad = protectionMarkerOnLoad
         self.loadAllGate = loadAllGate
         self.loadGate = loadGate
         self.saveGate = saveGate
@@ -770,6 +832,13 @@ private actor MockTunnelPreferences {
         }
         if let isEnabledOnLoad {
             manager.isEnabled = isEnabledOnLoad
+        }
+        if let protectionMarkerOnLoad,
+           let proto = manager.protocolConfiguration as? NETunnelProviderProtocol {
+            var configuration = proto.providerConfiguration ?? [:]
+            configuration[NETunnelProtection.configurationKey] = protectionMarkerOnLoad
+            proto.providerConfiguration = configuration
+            manager.protocolConfiguration = proto
         }
     }
 
