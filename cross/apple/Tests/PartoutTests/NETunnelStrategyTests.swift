@@ -21,7 +21,7 @@ struct NETunnelStrategyContractTests {
         let actions = await store.actions
         let manager = try #require(await store.savedManagers.first)
         let proto = try #require(manager.protocolConfiguration as? NETunnelProviderProtocol)
-        #expect(actions == [.load(nil), .save(profile.id)])
+        #expect(actions == [.loadAll, .load(nil), .save(profile.id)])
         #expect(manager.localizedDescription == profile.name)
         #expect(proto.providerBundleIdentifier == bundleIdentifier)
         #expect(proto.profileId == profile.id)
@@ -118,7 +118,7 @@ struct NETunnelStrategyContractTests {
         let response = try await strategy.sendMessage(Data(), to: profileId)
 
         #expect(response == nil)
-        #expect(await store.actions.isEmpty)
+        #expect(await store.actions == [.loadAll])
     }
 
     @Test
@@ -147,6 +147,141 @@ struct NETunnelStrategyContractTests {
 }
 
 struct NETunnelStrategyProtectionTests {
+    @Test(arguments: ["install", "save"])
+    func immediateConnectionLoadsSavedProtectionBeforeSwitching(_ operation: String) async throws {
+        let previous = try protectedProfile()
+        let next = try protectedProfile()
+        let store = MockTunnelPreferences(managers: [makeManager(
+            profileId: previous.id,
+            fingerprint: previous.name + ":Partout.RequireVPN:v1",
+            status: .connected,
+            isOnDemandEnabled: true,
+            protection: .requireVPN
+        )])
+        let strategy = makeStrategy(preferences: store.preferences, protection: { .requireVPN })
+        try await strategy.prepare(purge: false)
+        await #expect(throws: NETunnelStrategy.ProtectionError.profileSwitchRequiresDisablingProtection) {
+            if operation == "install" {
+                try await strategy.install(next, connect: true, options: nil)
+            } else {
+                try await strategy.save(next, forConnecting: true, options: nil)
+            }
+        }
+        #expect(await store.actions == [.loadAll])
+        #expect(await store.savedManagers.isEmpty)
+    }
+
+    @Test(arguments: ["disconnect", "remove", "uninstall"])
+    func immediateDestructiveOperationLoadsSavedProtection(_ operation: String) async throws {
+        let profile = try protectedProfile()
+        let store = MockTunnelPreferences(managers: [makeManager(
+            profileId: profile.id,
+            fingerprint: profile.name + ":Partout.RequireVPN:v1",
+            status: .connected,
+            isOnDemandEnabled: true,
+            protection: .requireVPN
+        )])
+        // Missing local policy cannot release an already saved strict manager.
+        let strategy = makeStrategy(preferences: store.preferences)
+        let expected: NETunnelStrategy.ProtectionError = operation == "disconnect"
+            ? .disconnectRequiresDisablingProtection : .removalRequiresDisablingProtection
+        await #expect(throws: expected) {
+            switch operation {
+            case "disconnect": try await strategy.disconnect(from: profile.id)
+            case "remove": try await strategy.remove(profileId: profile.id)
+            default: try await strategy.uninstall(profileId: profile.id)
+            }
+        }
+        #expect(await store.actions == [.loadAll])
+        #expect(await store.savedManagers.isEmpty)
+    }
+
+    @Test
+    func failedInitialLoadMustBeRetriedBeforeMutation() async throws {
+        let previous = try protectedProfile()
+        let next = try protectedProfile()
+        let store = MockTunnelPreferences(managers: [makeManager(
+            profileId: previous.id,
+            fingerprint: previous.name + ":Partout.RequireVPN:v1",
+            status: .connected,
+            isOnDemandEnabled: true,
+            protection: .requireVPN
+        )], loadAllFailures: 1)
+        let strategy = makeStrategy(preferences: store.preferences, protection: { .requireVPN })
+        await #expect(throws: PreferenceFailure.loadAll) {
+            try await strategy.install(next, connect: true, options: nil)
+        }
+        await #expect(throws: NETunnelStrategy.ProtectionError.profileSwitchRequiresDisablingProtection) {
+            try await strategy.install(next, connect: true, options: nil)
+        }
+        #expect(await store.actions == [.loadAll, .loadAll])
+        #expect(await store.savedManagers.isEmpty)
+    }
+
+    @Test(arguments: [NETunnelProtection.requireVPN.rawValue, "corrupt"])
+    func unidentifiedProtectedConfigurationRejectsInitialConnection(_ marker: String) async throws {
+        let profile = try protectedProfile()
+        let manager = makeManager(profileId: Profile.ID(), fingerprint: nil)
+        let proto = try #require(manager.protocolConfiguration as? NETunnelProviderProtocol)
+        proto.providerConfiguration?.removeValue(forKey: profileIdKey)
+        proto.providerConfiguration?[NETunnelProtection.configurationKey] = marker
+        manager.protocolConfiguration = proto
+        let store = MockTunnelPreferences(managers: [manager])
+        let strategy = makeStrategy(preferences: store.preferences)
+        await #expect(throws: NETunnelStrategy.ProtectionError.savedConfigurationDoesNotMeetPolicy) {
+            try await strategy.install(profile, connect: true, options: nil)
+        }
+        #expect(await store.actions == [.loadAll])
+    }
+
+    @Test(arguments: ["strictFirst", "strictLast", "malformedFirst", "malformedLast", "devicePolicy"])
+    func ambiguousProfileIdentifiersCannotHideProtectedConfiguration(_ ordering: String) async throws {
+        let profile = try protectedProfile()
+        let normal = makeManager(profileId: profile.id, fingerprint: profile.name)
+        let guarded = makeManager(profileId: profile.id, fingerprint: profile.name, protection: .requireVPN)
+        if ordering.hasPrefix("malformed") {
+            let proto = try #require(guarded.protocolConfiguration as? NETunnelProviderProtocol)
+            proto.providerConfiguration?[NETunnelProtection.configurationKey] = "corrupt"
+            guarded.protocolConfiguration = proto
+        } else if ordering == "devicePolicy" {
+            let proto = try #require(guarded.protocolConfiguration as? NETunnelProviderProtocol)
+            proto.providerConfiguration?.removeValue(forKey: NETunnelProtection.configurationKey)
+            guarded.protocolConfiguration = proto
+        }
+        let managers = ordering.hasSuffix("First") ? [guarded, normal] : [normal, guarded]
+        let store = MockTunnelPreferences(managers: managers)
+        let strategy = makeStrategy(preferences: store.preferences, protection: {
+            ordering == "devicePolicy" ? .requireVPN : .disabled
+        })
+        await #expect(throws: NETunnelStrategy.ProtectionError.savedConfigurationDoesNotMeetPolicy) {
+            try await strategy.install(profile, connect: true, options: nil)
+        }
+        #expect(await store.actions == [.loadAll])
+    }
+
+    @Test
+    func strictSourceSnapshotRetainsUnownedRunningManagerForSwitchChecks() async throws {
+        let previous = try protectedProfile()
+        let next = try protectedProfile()
+        let store = MockTunnelPreferences(managers: [makeManager(
+            profileId: previous.id, fingerprint: previous.name, status: .connected,
+            isOnDemandEnabled: true
+        )])
+        let (source, continuation) = AsyncStream.makeStream(of: ProfilesEvent.self)
+        let strategy = NETunnelStrategy(.global, bundleIdentifier: bundleIdentifier,
+            source: source, coder: protocolCoder, preferences: store.preferences,
+            protection: { .requireVPN }, fingerprint: { $0.name })
+        try await strategy.prepare(purge: false)
+        continuation.yield(.snapshot([]))
+        continuation.finish()
+        await store.waitForActionCount(1)
+        await #expect(throws: NETunnelStrategy.ProtectionError.profileSwitchRequiresDisablingProtection) {
+            try await strategy.install(next, connect: true, options: nil)
+        }
+        #expect(await store.actions == [.loadAll])
+        #expect(await store.savedManagers.isEmpty)
+    }
+
     @Test(arguments: ["fingerprint", "profileId", "providerBundleIdentifier"])
     func reconnectRechecksLoadedConfigurationIdentity(_ field: String) async throws {
         let profile = try protectedProfile()
@@ -256,7 +391,7 @@ struct NETunnelStrategyProtectionTests {
             try await save.value
         }
         #expect(await store.savedManagers.isEmpty)
-        #expect(await store.actions == [.load(nil)])
+        #expect(await store.actions == [.loadAll, .load(nil)])
     }
 
     @Test
@@ -308,7 +443,7 @@ struct NETunnelStrategyProtectionTests {
         try await save.value
         try await changePolicy.value
         #expect(policy.read() == .requireVPN)
-        #expect(await store.actions == [.load(nil), .save(profile.id)])
+        #expect(await store.actions == [.loadAll, .load(nil), .save(profile.id)])
     }
 
     @Test
@@ -334,7 +469,7 @@ struct NETunnelStrategyProtectionTests {
         await #expect(throws: NETunnelStrategy.ProtectionError.policyChangedDuringOperation) {
             try await strategy.save(profile, forConnecting: false, options: nil)
         }
-        #expect(await store.actions.isEmpty)
+        #expect(await store.actions == [.loadAll])
     }
     @Test
     func strictManagerRejectsDisconnectRemovalAndReconfigurationWithoutPreferenceWrites() async throws {
@@ -548,7 +683,7 @@ struct NETunnelStrategyProtectionTests {
         await #expect(throws: NETunnelStrategy.ProtectionError.reconfigurationRequiresDisablingProtection) {
             try await strategy.save(profile, forConnecting: false, options: nil)
         }
-        #expect(await store.actions.isEmpty)
+        #expect(await store.actions == [.loadAll])
     }
 
     @Test
@@ -764,6 +899,7 @@ private func makeOnDemandProfile(isActive: Bool) throws -> Profile {
 // MARK: - Preferences mock
 
 private enum PreferenceFailure: Error {
+    case loadAll
     case save
     case remove
 }
@@ -796,6 +932,7 @@ private actor MockTunnelPreferences {
     private let protectionMarkerOnLoad: String?
     private let loadMutation: (@Sendable (NETunnelProviderManager) -> Void)?
     private let loadAllGate: PreferenceGate?
+    private var loadAllFailures: Int
     private let loadGate: PreferenceGate?
     private let saveGate: PreferenceGate?
     private let saveFailures: Set<Profile.ID>
@@ -811,6 +948,7 @@ private actor MockTunnelPreferences {
         protectionMarkerOnLoad: String? = nil,
         loadMutation: (@Sendable (NETunnelProviderManager) -> Void)? = nil,
         loadAllGate: PreferenceGate? = nil,
+        loadAllFailures: Int = 0,
         loadGate: PreferenceGate? = nil,
         saveGate: PreferenceGate? = nil,
         saveFailures: Set<Profile.ID> = [],
@@ -821,6 +959,7 @@ private actor MockTunnelPreferences {
         self.protectionMarkerOnLoad = protectionMarkerOnLoad
         self.loadMutation = loadMutation
         self.loadAllGate = loadAllGate
+        self.loadAllFailures = loadAllFailures
         self.loadGate = loadGate
         self.saveGate = saveGate
         self.saveFailures = saveFailures
@@ -831,7 +970,7 @@ private actor MockTunnelPreferences {
         NETunnelPreferences(
             loadAll: { [weak self] in
                 guard let self else { throw CancellationError() }
-                return await self.performLoadAll().value
+                return try await self.performLoadAll().value
             },
             load: { [weak self] manager in
                 guard let self else { throw CancellationError() }
@@ -855,8 +994,12 @@ private actor MockTunnelPreferences {
         }
     }
 
-    private func performLoadAll() async -> SendableManagers {
+    private func performLoadAll() async throws -> SendableManagers {
         record(.loadAll)
+        if loadAllFailures > 0 {
+            loadAllFailures -= 1
+            throw PreferenceFailure.loadAll
+        }
         if let loadAllGate {
             await loadAllGate.wait()
         }

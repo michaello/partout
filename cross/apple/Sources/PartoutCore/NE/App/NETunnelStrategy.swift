@@ -32,6 +32,8 @@ public actor NETunnelStrategy {
 
     private var mutationTail: Task<Void, Never>?
 
+    private var didLoadManagers = false
+
     public init(
         _ ctx: PartoutLoggerContext,
         bundleIdentifier: String,
@@ -105,6 +107,8 @@ extension NETunnelStrategy: TunnelObservableStrategy {
         try await withMutation { strategy in
             let policy = try strategy.protection()
             try policy.validate(profile)
+            try await strategy.loadManagersIfNeeded()
+            try strategy.requireUnchangedProtection(policy)
             if connect {
                 // A switch has no verified gap-free transition yet. Reject it before
                 // touching the current manager, including when enabling protection.
@@ -229,6 +233,8 @@ extension NETunnelStrategy {
             guard try strategy.protection() == .disabled else {
                 throw ProtectionError.devicePolicyStillRequiresVPN
             }
+            try await strategy.loadManagersIfNeeded()
+            try strategy.requireUnchangedProtection(.disabled)
             guard let manager = strategy.allManagers[profileId] else { return }
             try await strategy.saveManager(manager, expectedProtection: .disabled, allowsProtectionRelease: true) {
                 if let proto = $0.protocolConfiguration as? NETunnelProviderProtocol {
@@ -251,6 +257,12 @@ private extension NETunnelStrategy {
         guard try protection() == expected else {
             throw ProtectionError.policyChangedDuringOperation
         }
+    }
+
+    func loadManagersIfNeeded() async throws {
+        guard !didLoadManagers else { return }
+        allManagers = try await reloadAllManagers()
+        didLoadManagers = true
     }
 
     func isProtected(_ manager: NETunnelProviderManager) throws -> Bool {
@@ -310,6 +322,8 @@ private extension NETunnelStrategy {
 
         let policy = try protection()
         try policy.validate(profile)
+        try await loadManagersIfNeeded()
+        try requireUnchangedProtection(policy)
         if forConnecting {
             try validateConnectionTransition(to: profile.id, protection: policy)
         }
@@ -401,6 +415,9 @@ private extension NETunnelStrategy {
     }
 
     func performRemove(profileId: Profile.ID) async throws {
+        let policy = try protection()
+        try await loadManagersIfNeeded()
+        try requireUnchangedProtection(policy)
         guard let manager = allManagers[profileId] else {
             return
         }
@@ -450,6 +467,7 @@ private extension NETunnelStrategy {
         var managers: [Profile.ID: NETunnelProviderManager]
         do {
             managers = try await reloadAllManagers()
+            didLoadManagers = true
         } catch {
             pp_log(ctx, .os, .fault, "Unable to reload managers: \(error)")
             return
@@ -457,13 +475,14 @@ private extension NETunnelStrategy {
 
         // Remove managers that are no longer backed by the source.
         let profileIds = Set(profiles.map(\.id))
+        let retainsUnownedManagers = (try? protection()) != .disabled
         managers = managers.filter {
             let profileId = $0.key
             guard profileIds.contains(profileId) else {
                 // Source deletion or an iCloud snapshot cannot release protection.
                 // Preserve malformed policy markers as well as armed managers.
                 let protected = (try? isProtected($0.value)) ?? true
-                if protected { return true }
+                if protected || retainsUnownedManagers { return true }
                 pp_log(ctx, .os, .debug, "Ignore manager (unowned id: \(profileId))")
                 return false
             }
@@ -609,6 +628,9 @@ private extension NETunnelStrategy {
     }
 
     func performDisconnect(from profileId: Profile.ID) async throws {
+        let policy = try protection()
+        try await loadManagersIfNeeded()
+        try requireUnchangedProtection(policy)
         guard let manager = allManagers[profileId] else {
             return
         }
@@ -729,17 +751,26 @@ private extension NETunnelStrategy {
             }
             guard let profileId = proto.profileId else {
                 pp_log(ctx, .os, .debug, "Discard manager (missing id)")
-                // Unknown configuration must not be removed as a side effect
-                // while device protection may be required.
-                if try protection() == .disabled,
-                   (try? NETunnelProtection(protocolConfiguration: proto)) == .disabled {
-                    try await preferences.remove(manager)
+                // Unknown protected state cannot be omitted from switch checks.
+                guard try protection() == .disabled,
+                      (try? NETunnelProtection(protocolConfiguration: proto)) == .disabled else {
+                    throw ProtectionError.savedConfigurationDoesNotMeetPolicy
                 }
+                try await preferences.remove(manager)
                 continue
             }
             guard coder.owns(proto, for: profileId) else {
                 pp_log(ctx, .os, .debug, "Ignore manager (different owner)")
                 continue
+            }
+            if let existing = managers[profileId] {
+                // A dictionary must not hide one protected manager behind another
+                // configuration that happens to carry the same profile identifier.
+                guard try protection() == .disabled,
+                      (try? isProtected(existing)) == false,
+                      (try? isProtected(manager)) == false else {
+                    throw ProtectionError.savedConfigurationDoesNotMeetPolicy
+                }
             }
             managers[profileId] = manager
         }
