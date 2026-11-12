@@ -146,6 +146,188 @@ struct NETunnelStrategyContractTests {
     }
 }
 
+struct NETunnelStrategyProtectionTests {
+    @Test
+    func strictManagerRejectsDisconnectRemovalAndReconfigurationWithoutPreferenceWrites() async throws {
+        let profile = try protectedProfile()
+        let store = MockTunnelPreferences(managers: [makeManager(
+            profileId: profile.id,
+            fingerprint: profile.name + ":Partout.RequireVPN:v1",
+            status: .connected,
+            isOnDemandEnabled: true,
+            protection: .requireVPN
+        )])
+        let strategy = try await makePreparedStrategy(profile: profile, store: store, protection: { .requireVPN })
+
+        await #expect(throws: NETunnelStrategy.ProtectionError.disconnectRequiresDisablingProtection) {
+            try await strategy.disconnect(from: profile.id)
+        }
+        await #expect(throws: NETunnelStrategy.ProtectionError.removalRequiresDisablingProtection) {
+            try await strategy.uninstall(profileId: profile.id)
+        }
+        var changed = profile.builder()
+        changed.name = "Changed"
+        let replacement = try changed.build()
+        await #expect(throws: NETunnelStrategy.ProtectionError.reconfigurationRequiresDisablingProtection) {
+            try await strategy.save(replacement, forConnecting: false, options: nil)
+        }
+        #expect(await store.actions == [.loadAll])
+    }
+
+    @Test
+    func savedProtectionSurvivesDisabledDevicePolicyUntilExplicitRelease() async throws {
+        let profile = try protectedProfile()
+        let store = MockTunnelPreferences(managers: [makeManager(
+            profileId: profile.id,
+            fingerprint: profile.name,
+            status: .disconnected,
+            isOnDemandEnabled: true,
+            protection: .requireVPN
+        )])
+        let strategy = try await makePreparedStrategy(profile: profile, store: store)
+
+        await #expect(throws: NETunnelStrategy.ProtectionError.disconnectRequiresDisablingProtection) {
+            try await strategy.disconnect(from: profile.id)
+        }
+        await #expect(throws: NETunnelStrategy.ProtectionError.removalRequiresDisablingProtection) {
+            try await strategy.remove(profileId: profile.id)
+        }
+        try await strategy.allowUnprotectedInternet(from: profile.id)
+        let saved = try #require(await store.savedManagers.last)
+        #expect(!saved.isOnDemandEnabled)
+        let proto = try #require(saved.protocolConfiguration)
+        #expect(try NETunnelProtection(protocolConfiguration: proto) == .disabled)
+    }
+
+    @Test
+    func sourceSnapshotCannotForgetProtectedManagerDeletedFromProfiles() async throws {
+        let profile = try protectedProfile()
+        let store = MockTunnelPreferences(managers: [makeManager(
+            profileId: profile.id,
+            fingerprint: profile.name + ":Partout.RequireVPN:v1",
+            status: .connected,
+            isOnDemandEnabled: true,
+            protection: .requireVPN
+        )])
+        let (source, continuation) = AsyncStream.makeStream(of: ProfilesEvent.self)
+        let strategy = NETunnelStrategy(
+            .global,
+            bundleIdentifier: bundleIdentifier,
+            source: source,
+            coder: protocolCoder,
+            preferences: store.preferences,
+            protection: { .requireVPN },
+            fingerprint: { $0.name }
+        )
+        try await strategy.prepare(purge: false)
+        continuation.yield(.snapshot([]))
+        continuation.finish()
+        await store.waitForActionCount(1)
+        await #expect(throws: NETunnelStrategy.ProtectionError.disconnectRequiresDisablingProtection) {
+            try await strategy.disconnect(from: profile.id)
+        }
+        #expect(await store.actions == [.loadAll])
+    }
+
+    @Test
+    func invalidSavedMarkerPreventsRemoval() async throws {
+        let profile = try protectedProfile()
+        let manager = makeManager(profileId: profile.id, fingerprint: profile.name)
+        let proto = try #require(manager.protocolConfiguration as? NETunnelProviderProtocol)
+        proto.providerConfiguration?[NETunnelProtection.configurationKey] = "corrupt"
+        let store = MockTunnelPreferences(managers: [manager])
+        let strategy = try await makePreparedStrategy(profile: profile, store: store)
+        await #expect(throws: NETunnelProtectionError.invalidConfiguration) {
+            try await strategy.remove(profileId: profile.id)
+        }
+        #expect(await store.actions == [.loadAll])
+    }
+
+    @Test
+    func explicitReleaseRequiresDisabledDevicePolicy() async throws {
+        let store = MockTunnelPreferences()
+        let strategy = makeStrategy(preferences: store.preferences, protection: { .requireVPN })
+        await #expect(throws: NETunnelStrategy.ProtectionError.devicePolicyStillRequiresVPN) {
+            try await strategy.allowUnprotectedInternet(from: Profile.ID())
+        }
+        #expect(await store.actions.isEmpty)
+    }
+
+    @Test
+    func protectionReadFailurePreventsPreferenceMutation() async throws {
+        let profile = try protectedProfile()
+        let store = MockTunnelPreferences()
+        let strategy = makeStrategy(preferences: store.preferences, protection: {
+            throw NETunnelProtectionError.invalidConfiguration
+        })
+        await #expect(throws: NETunnelProtectionError.invalidConfiguration) {
+            try await strategy.install(profile, connect: true, options: nil)
+        }
+        #expect(await store.actions.isEmpty)
+    }
+
+    @Test
+    func switchingProtectedProfileIsRejectedBeforeDisconnect() async throws {
+        let current = try protectedProfile()
+        let replacement = try protectedProfile()
+        let store = MockTunnelPreferences(managers: [makeManager(
+            profileId: current.id,
+            fingerprint: current.name + ":Partout.RequireVPN:v1",
+            status: .connected,
+            isOnDemandEnabled: true,
+            protection: .requireVPN
+        )])
+        let strategy = try await makePreparedStrategy(profile: current, store: store, protection: { .requireVPN })
+        await #expect(throws: NETunnelStrategy.ProtectionError.profileSwitchRequiresDisablingProtection) {
+            try await strategy.install(replacement, connect: true, options: nil)
+        }
+        #expect(await store.actions == [.loadAll])
+    }
+
+    @Test
+    func sourceReconciliationCannotArmArbitraryProfile() async throws {
+        let profile = try protectedProfile()
+        let store = MockTunnelPreferences()
+        let strategy = makeStrategy(preferences: store.preferences, protection: { .requireVPN })
+        await #expect(throws: NETunnelStrategy.ProtectionError.reconfigurationRequiresDisablingProtection) {
+            try await strategy.save(profile, forConnecting: false, options: nil)
+        }
+        #expect(await store.actions.isEmpty)
+    }
+
+    @Test
+    func initialStrictConnectOverridesOnDemandRulesAndFingerprintsPolicy() async throws {
+        let profile = try protectedProfile()
+        let store = MockTunnelPreferences(managers: [makeManager(
+            profileId: profile.id,
+            fingerprint: profile.name,
+            status: .disconnected
+        )])
+        let strategy = try await makePreparedStrategy(profile: profile, store: store, protection: { .requireVPN })
+        try await strategy.install(profile, connect: true, options: nil)
+        let manager = try #require(await store.savedManagers.last)
+        #expect(manager.isEnabled)
+        #expect(manager.isOnDemandEnabled)
+        #expect(manager.onDemandRules?.count == 1)
+        #expect(manager.onDemandRules?.first is NEOnDemandRuleConnect)
+        #expect(manager.onDemandRules?.first?.interfaceTypeMatch == .any)
+        let proto = try #require(manager.protocolConfiguration as? NETunnelProviderProtocol)
+        #expect(try NETunnelProtection(protocolConfiguration: proto) == .requireVPN)
+        #expect(proto.providerConfiguration?[fingerprintKey] as? String == profile.name + ":Partout.RequireVPN:v1")
+    }
+
+    private func protectedProfile() throws -> Profile {
+        try Profile.Builder(
+            name: "Protected",
+            modules: [OpenVPNModule(
+                id: UniqueID(),
+                configuration: OpenVPNConfiguration(remotes: [try ExtendedEndpoint("192.0.2.1", .init(.udp, 1194))])
+            )],
+            activatingModules: true
+        ).build()
+    }
+}
+
 struct NETunnelStrategySnapshotTests {
     @Test
     func snapshotReconcilesStaleAndChangedManagersAndContinuesAfterFailures() async throws {
@@ -279,7 +461,8 @@ private var protocolCoder: ProviderNEProtocolCoder {
 }
 
 private func makeStrategy(
-    preferences: NETunnelPreferences
+    preferences: NETunnelPreferences,
+    protection: @escaping @Sendable () throws -> NETunnelProtection = { .disabled }
 ) -> NETunnelStrategy {
     NETunnelStrategy(
         .global,
@@ -287,13 +470,15 @@ private func makeStrategy(
         source: AsyncStream { $0.finish() },
         coder: protocolCoder,
         preferences: preferences,
+        protection: protection,
         fingerprint: { $0.name }
     )
 }
 
 private func makePreparedStrategy(
     profile: Profile,
-    store: MockTunnelPreferences
+    store: MockTunnelPreferences,
+    protection: @escaping @Sendable () throws -> NETunnelProtection = { .disabled }
 ) async throws -> NETunnelStrategy {
     let (source, continuation) = AsyncStream.makeStream(of: ProfilesEvent.self)
     let strategy = NETunnelStrategy(
@@ -302,6 +487,7 @@ private func makePreparedStrategy(
         source: source,
         coder: protocolCoder,
         preferences: store.preferences,
+        protection: protection,
         fingerprint: { $0.name }
     )
     try await strategy.prepare(purge: false)
@@ -494,12 +680,16 @@ private func makeManager(
     profileId: Profile.ID,
     fingerprint: String?,
     status: NEVPNStatus? = nil,
-    isOnDemandEnabled: Bool = false
+    isOnDemandEnabled: Bool = false,
+    protection: NETunnelProtection = .disabled
 ) -> NETunnelProviderManager {
     let proto = NETunnelProviderProtocol()
     proto.providerBundleIdentifier = bundleIdentifier
     var providerConfiguration: [String: Any] = [profileIdKey: profileId.uuidString]
     providerConfiguration[fingerprintKey] = fingerprint
+    if protection == .requireVPN {
+        providerConfiguration[NETunnelProtection.configurationKey] = protection.rawValue
+    }
     proto.providerConfiguration = providerConfiguration
     let manager = status.map(TestTunnelProviderManager.init) ?? NETunnelProviderManager()
     manager.protocolConfiguration = proto
@@ -531,6 +721,10 @@ private final class TestVPNConnection: NEVPNConnection {
     override var status: NEVPNStatus {
         testStatus
     }
+
+    override func startVPNTunnel(options: [String: NSObject]? = nil) throws {}
+
+    override func stopVPNTunnel() {}
 }
 
 private extension NETunnelProviderManager {

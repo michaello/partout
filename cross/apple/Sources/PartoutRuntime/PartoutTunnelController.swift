@@ -67,7 +67,14 @@ final class PartoutTunnelController: Sendable {
             throw PartoutError(.releasedObject)
         }
         let profile = try info.profile.asProfile()
-        let tunnelSettings = profile.networkSettings(with: info, options: options)
+        let protection = try NETunnelProtection(protocolConfiguration: provider.protocolConfiguration)
+        let tunnelSettings: NEPacketTunnelNetworkSettings
+        switch protection {
+        case .disabled:
+            tunnelSettings = profile.networkSettings(with: info, options: options)
+        case .requireVPN:
+            tunnelSettings = try profile.protectedNetworkSettings(with: info, options: options)
+        }
         pp_log(ctx, .runtime, .info, "Commit tunnel settings: \(tunnelSettings)")
         try await provider.setTunnelNetworkSettings(tunnelSettings)
     }
@@ -112,6 +119,12 @@ final class PartoutTunnelController: Sendable {
         } else {
             pp_log(ctx, .runtime, .notice, "Dispose tunnel")
         }
+        // The native daemon classifies transport failures before this boundary:
+        // reconnectable failures retain the session and never call cancel_tunnel.
+        // This callback means terminal disposal (or a forced stop), when retaining
+        // a paused native daemon would not provide a working reconnection path.
+        // Cancellation must never rewrite saved preferences or the device policy.
+        // Protection across provider exit remains a separate acceptance test.
         provider.cancelTunnelWithError(error)
     }
 }

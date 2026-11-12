@@ -18,6 +18,8 @@ public actor NETunnelStrategy {
 
     private let fingerprint: @Sendable (Profile) -> String?
 
+    private let protection: @Sendable () throws -> NETunnelProtection
+
     private nonisolated let managerSnapshotsSubject: CurrentValueStream<[Profile.ID: NETunnelManagerSnapshot]>
 
     private var allManagers: [Profile.ID: NETunnelProviderManager] {
@@ -35,6 +37,7 @@ public actor NETunnelStrategy {
         bundleIdentifier: String,
         source: AsyncStream<ProfilesEvent>,
         coder: NEProtocolCoder,
+        protection: @escaping @Sendable () throws -> NETunnelProtection = { .disabled },
         fingerprint: @escaping @Sendable (Profile) -> String?
     ) {
         self.init(
@@ -43,6 +46,7 @@ public actor NETunnelStrategy {
             source: source,
             coder: coder,
             preferences: .live,
+            protection: protection,
             fingerprint: fingerprint
         )
     }
@@ -53,6 +57,7 @@ public actor NETunnelStrategy {
         source: AsyncStream<ProfilesEvent>,
         coder: NEProtocolCoder,
         preferences: NETunnelPreferences,
+        protection: @escaping @Sendable () throws -> NETunnelProtection = { .disabled },
         fingerprint: @escaping @Sendable (Profile) -> String?
     ) {
         pp_log(ctx, .os, .info, "NETunnelStrategy.init()")
@@ -62,6 +67,7 @@ public actor NETunnelStrategy {
         self.coder = coder
         self.preferences = preferences
         self.fingerprint = fingerprint
+        self.protection = protection
         managerSnapshotsSubject = CurrentValueStream([:])
         allManagers = [:]
 
@@ -97,8 +103,15 @@ extension NETunnelStrategy: TunnelObservableStrategy {
 
     public func install(_ profile: Profile, connect: Bool, options: Sendable?) async throws {
         try await withMutation { strategy in
+            let policy = try strategy.protection()
+            try policy.validate(profile)
             if connect {
-                await strategy.disconnectCurrentManagers()
+                // A switch has no verified gap-free transition yet. Reject it before
+                // touching the current manager, including when enabling protection.
+                try strategy.validateConnectionTransition(to: profile.id, protection: policy)
+                if policy == .disabled {
+                    try await strategy.disconnectCurrentManagers()
+                }
             }
             let nsOptions = options as? [String: NSObject]
             try await strategy.performSave(profile, forConnecting: connect, options: nsOptions)
@@ -187,22 +200,110 @@ extension NETunnelStrategy {
     }
 }
 
+extension NETunnelStrategy {
+    public enum ProtectionError: Error, Equatable {
+        case disconnectRequiresDisablingProtection
+        case removalRequiresDisablingProtection
+        case reconfigurationRequiresDisablingProtection
+        case profileSwitchRequiresDisablingProtection
+        case devicePolicyStillRequiresVPN
+    }
+
+    /// Call only after the user explicitly chooses to allow unprotected internet
+    /// and the device policy has been persisted as disabled.
+    public func allowUnprotectedInternet(from profileId: Profile.ID) async throws {
+        try await withMutation { strategy in
+            guard try strategy.protection() == .disabled else {
+                throw ProtectionError.devicePolicyStillRequiresVPN
+            }
+            guard let manager = strategy.allManagers[profileId] else { return }
+            try await strategy.saveManager(manager) {
+                if let proto = $0.protocolConfiguration as? NETunnelProviderProtocol {
+                    var configuration = proto.providerConfiguration ?? [:]
+                    configuration.removeValue(forKey: NETunnelProtection.configurationKey)
+                    proto.providerConfiguration = configuration
+                    // Force a normal configuration rebuild on the next source update.
+                    proto.fingerprint = nil
+                    $0.protocolConfiguration = proto
+                }
+                $0.isOnDemandEnabled = false
+            }
+            try await strategy.stopManager(manager)
+        }
+    }
+}
+
 private extension NETunnelStrategy {
+    func isProtected(_ manager: NETunnelProviderManager) throws -> Bool {
+        guard let proto = manager.tunnelProtocol else { return false }
+        return try NETunnelProtection(protocolConfiguration: proto) == .requireVPN
+    }
+
+    func configurationFingerprint(_ profile: Profile, protection: NETunnelProtection) -> String? {
+        guard let value = fingerprint(profile) else { return nil }
+        return protection == .requireVPN ? value + ":Partout.RequireVPN:v1" : value
+    }
+
+    func validateConnectionTransition(to profileId: Profile.ID, protection: NETunnelProtection) throws {
+        for (currentId, manager) in allManagers {
+            let protected = try isProtected(manager)
+            let needsDisconnect = manager.connection.status.asTunnelStatus != .inactive || manager.isOnDemandEnabled
+            if protected, currentId != profileId {
+                throw ProtectionError.profileSwitchRequiresDisablingProtection
+            }
+            if protection == .requireVPN, needsDisconnect, currentId != profileId {
+                throw ProtectionError.profileSwitchRequiresDisablingProtection
+            }
+        }
+    }
+
     func performSave(_ profile: Profile, forConnecting: Bool, options: [String: NSObject]?) async throws {
         profile.log(.core, .notice, withPreamble: "Encoded profile:")
 
+        let policy = try protection()
+        try policy.validate(profile)
+        if forConnecting {
+            try validateConnectionTransition(to: profile.id, protection: policy)
+        }
+        let protectedManagers = try allManagers.filter { try isProtected($0.value) }
+        if let existing = protectedManagers[profile.id] {
+            // Even a same-profile settings replacement requires transition evidence.
+            guard policy == .requireVPN,
+                  let expectedFingerprint = configurationFingerprint(profile, protection: policy),
+                  existing.fingerprint == expectedFingerprint else {
+                throw ProtectionError.reconfigurationRequiresDisablingProtection
+            }
+            if forConnecting {
+                try existing.connection.startVPNTunnel(options: options)
+            }
+            return
+        }
+        if policy == .requireVPN {
+            guard protectedManagers.isEmpty else {
+                throw ProtectionError.profileSwitchRequiresDisablingProtection
+            }
+            // Reconciliation must not select and enable arbitrary synced profiles.
+            // The first strict manager is installed by an explicit connect action.
+            guard forConnecting else {
+                throw ProtectionError.reconfigurationRequiresDisablingProtection
+            }
+        }
         let proto = try coder.protocolConfiguration(from: profile)
+        try policy.apply(to: proto, profile: profile)
 
-        // Store custom data on the side
+        // Protection settings are part of the saved configuration identity.
         proto.profileId = profile.id
-        proto.fingerprint = fingerprint(profile)
+        proto.fingerprint = configurationFingerprint(profile, protection: policy)
 
         let manager = try await saveManager(profile.id) {
             $0.localizedDescription = profile.name
             $0.protocolConfiguration = proto
 
             let shouldEnableOnDemand: Bool
-            if profile.isInteractive {
+            if policy == .requireVPN {
+                $0.onDemandRules = [NEOnDemandRuleConnect()]
+                shouldEnableOnDemand = true
+            } else if profile.isInteractive {
                 shouldEnableOnDemand = false
             } else if let onDemandModule = profile.firstModule(ofType: OnDemandModule.self, ifActive: true) {
                 let rules = onDemandModule.neRules(self.ctx)
@@ -221,8 +322,8 @@ private extension NETunnelStrategy {
             let tunnelStatus = $0.connection.status.asTunnelStatus
             let isRunning = [.active, .activating].contains(tunnelStatus)
             let canEnableOnDemand = forConnecting || isRunning || $0.isOnDemandEnabled
-            $0.isEnabled = forConnecting || $0.isEnabled
-            $0.isOnDemandEnabled = canEnableOnDemand && shouldEnableOnDemand
+            $0.isEnabled = policy == .requireVPN || forConnecting || $0.isEnabled
+            $0.isOnDemandEnabled = (policy == .requireVPN || canEnableOnDemand) && shouldEnableOnDemand
         }
 
         // Track the new/updated manager
@@ -237,6 +338,9 @@ private extension NETunnelStrategy {
     func performRemove(profileId: Profile.ID) async throws {
         guard let manager = allManagers[profileId] else {
             return
+        }
+        guard try protection() == .disabled, try !isProtected(manager) else {
+            throw ProtectionError.removalRequiresDisablingProtection
         }
         try await preferences.remove(manager)
         allManagers.removeValue(forKey: profileId)
@@ -284,6 +388,10 @@ private extension NETunnelStrategy {
         managers = managers.filter {
             let profileId = $0.key
             guard profileIds.contains(profileId) else {
+                // Source deletion or an iCloud snapshot cannot release protection.
+                // Preserve malformed policy markers as well as armed managers.
+                let protected = (try? isProtected($0.value)) ?? true
+                if protected { return true }
                 pp_log(ctx, .os, .debug, "Ignore manager (unowned id: \(profileId))")
                 return false
             }
@@ -300,7 +408,8 @@ private extension NETunnelStrategy {
             // If the profile is associated with a manager, ensure that
             // it truly requires an update by comparing fingerprints.
             if let manager = managers[profile.id], let fp = manager.fingerprint {
-                guard fp != fingerprint(profile) else {
+                let expectedFingerprint = try? configurationFingerprint(profile, protection: protection())
+                guard fp != expectedFingerprint else {
                     pp_log(ctx, .os, .debug, "Manager \(profile.id) is up-to-date (fingerprint matches)")
                     actuallySaved += 1
                     continue
@@ -418,6 +527,13 @@ private extension NETunnelStrategy {
         guard let manager = allManagers[profileId] else {
             return
         }
+        guard try protection() == .disabled, try !isProtected(manager) else {
+            throw ProtectionError.disconnectRequiresDisablingProtection
+        }
+        try await stopManager(manager)
+    }
+
+    func stopManager(_ manager: NETunnelProviderManager) async throws {
         try await saveManager(manager) {
             $0.isOnDemandEnabled = false
         }
@@ -428,18 +544,14 @@ private extension NETunnelStrategy {
         await manager.connection.waitForDisconnection()
     }
 
-    func disconnectCurrentManagers() async {
+    func disconnectCurrentManagers() async throws {
         let profileIds = allManagers.compactMap { profileId, manager in
             let status = manager.connection.status.asTunnelStatus
             return status != .inactive || manager.isOnDemandEnabled ? profileId : nil
         }
         for profileId in profileIds {
             pp_log(ctx, .os, .notice, "Disconnect from \(profileId)...")
-            do {
-                try await performDisconnect(from: profileId)
-            } catch {
-                pp_log(ctx, .os, .error, "Unable to disconnect from \(profileId): \(error)")
-            }
+            try await performDisconnect(from: profileId)
             pp_log(ctx, .os, .notice, "Disconnection of \(profileId) complete!")
         }
     }
@@ -528,7 +640,12 @@ private extension NETunnelStrategy {
             }
             guard let profileId = proto.profileId else {
                 pp_log(ctx, .os, .debug, "Discard manager (missing id)")
-                manager.removeFromPreferences(completionHandler: nil)
+                // Unknown configuration must not be removed as a side effect
+                // while device protection may be required.
+                if try protection() == .disabled,
+                   (try? NETunnelProtection(protocolConfiguration: proto)) == .disabled {
+                    try await preferences.remove(manager)
+                }
                 continue
             }
             guard coder.owns(proto, for: profileId) else {
