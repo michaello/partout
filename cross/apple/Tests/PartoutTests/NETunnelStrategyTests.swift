@@ -148,6 +148,103 @@ struct NETunnelStrategyContractTests {
 
 struct NETunnelStrategyProtectionTests {
     @Test
+    func policyChangeWhileLoadingRejectsSaveBeforeMutation() async throws {
+        let policy = MutableProtection()
+        let loadGate = PreferenceGate()
+        let store = MockTunnelPreferences(loadGate: loadGate)
+        let strategy = makeStrategy(preferences: store.preferences, protection: { policy.read() })
+        let profile = try Profile.Builder(name: "Normal").build()
+        let save = Task {
+            try await strategy.save(profile, forConnecting: false, options: nil)
+        }
+        await loadGate.waitUntilEntered()
+        policy.set(.requireVPN)
+        await loadGate.open()
+        await #expect(throws: NETunnelStrategy.ProtectionError.policyChangedDuringOperation) {
+            try await save.value
+        }
+        #expect(await store.savedManagers.isEmpty)
+        #expect(await store.actions == [.load(nil)])
+    }
+
+    @Test
+    func policyChangeWhileLoadingRejectsDisconnectBeforeDisablingOnDemand() async throws {
+        let policy = MutableProtection()
+        let loadGate = PreferenceGate()
+        let profile = try protectedProfile()
+        let manager = makeManager(
+            profileId: profile.id,
+            fingerprint: profile.name,
+            status: .disconnected,
+            isOnDemandEnabled: true
+        )
+        let store = MockTunnelPreferences(managers: [manager], loadGate: loadGate)
+        let strategy = try await makePreparedStrategy(profile: profile, store: store, protection: { policy.read() })
+        let disconnect = Task {
+            try await strategy.disconnect(from: profile.id)
+        }
+        await loadGate.waitUntilEntered()
+        policy.set(.requireVPN)
+        await loadGate.open()
+        await #expect(throws: NETunnelStrategy.ProtectionError.policyChangedDuringOperation) {
+            try await disconnect.value
+        }
+        #expect(manager.isOnDemandEnabled)
+        #expect(await store.savedManagers.isEmpty)
+        #expect(await store.actions == [.loadAll, .load(profile.id)])
+    }
+
+    @Test
+    func serializedDevicePolicyMutationWaitsForPreferenceSave() async throws {
+        let policy = MutableProtection()
+        let saveGate = PreferenceGate()
+        let store = MockTunnelPreferences(saveGate: saveGate)
+        let strategy = makeStrategy(preferences: store.preferences, protection: { policy.read() })
+        let profile = try Profile.Builder(name: "Normal").build()
+        let save = Task {
+            try await strategy.save(profile, forConnecting: false, options: nil)
+        }
+        await saveGate.waitUntilEntered()
+        let changePolicy = Task {
+            try await strategy.withDevicePolicyMutation {
+                policy.set(.requireVPN)
+            }
+        }
+        for _ in 0..<10 { await Task.yield() }
+        #expect(policy.read() == .disabled)
+        await saveGate.open()
+        try await save.value
+        try await changePolicy.value
+        #expect(policy.read() == .requireVPN)
+        #expect(await store.actions == [.load(nil), .save(profile.id)])
+    }
+
+    @Test
+    func disabledStrategyCannotDowngradeStrictCoderOutput() async throws {
+        let profile = try protectedProfile()
+        let store = MockTunnelPreferences()
+        let coder = ProviderNEProtocolCoder(
+            .global,
+            tunnelBundleIdentifier: bundleIdentifier,
+            coder: BasicProfileCoder(),
+            uid: 100,
+            protection: { .requireVPN }
+        )
+        let strategy = NETunnelStrategy(
+            .global,
+            bundleIdentifier: bundleIdentifier,
+            source: AsyncStream { $0.finish() },
+            coder: coder,
+            preferences: store.preferences,
+            protection: { .disabled },
+            fingerprint: { $0.name }
+        )
+        await #expect(throws: NETunnelStrategy.ProtectionError.policyChangedDuringOperation) {
+            try await strategy.save(profile, forConnecting: false, options: nil)
+        }
+        #expect(await store.actions.isEmpty)
+    }
+    @Test
     func strictManagerRejectsDisconnectRemovalAndReconfigurationWithoutPreferenceWrites() async throws {
         let profile = try protectedProfile()
         let store = MockTunnelPreferences(managers: [makeManager(
@@ -603,6 +700,8 @@ private actor MockTunnelPreferences {
     private let managers: [NETunnelProviderManager]
     private let isEnabledOnLoad: Bool?
     private let loadAllGate: PreferenceGate?
+    private let loadGate: PreferenceGate?
+    private let saveGate: PreferenceGate?
     private let saveFailures: Set<Profile.ID>
     private let removeFailures: Set<Profile.ID>
     private var actionCountContinuations: [(Int, CheckedContinuation<Void, Never>)] = []
@@ -614,12 +713,16 @@ private actor MockTunnelPreferences {
         managers: [NETunnelProviderManager] = [],
         isEnabledOnLoad: Bool? = nil,
         loadAllGate: PreferenceGate? = nil,
+        loadGate: PreferenceGate? = nil,
+        saveGate: PreferenceGate? = nil,
         saveFailures: Set<Profile.ID> = [],
         removeFailures: Set<Profile.ID> = []
     ) {
         self.managers = managers
         self.isEnabledOnLoad = isEnabledOnLoad
         self.loadAllGate = loadAllGate
+        self.loadGate = loadGate
+        self.saveGate = saveGate
         self.saveFailures = saveFailures
         self.removeFailures = removeFailures
     }
@@ -660,17 +763,23 @@ private actor MockTunnelPreferences {
         return SendableManagers(managers)
     }
 
-    private func performLoad(_ manager: NETunnelProviderManager) {
+    private func performLoad(_ manager: NETunnelProviderManager) async {
         record(.load(manager.profileId))
+        if let loadGate {
+            await loadGate.wait()
+        }
         if let isEnabledOnLoad {
             manager.isEnabled = isEnabledOnLoad
         }
     }
 
-    private func performSave(_ manager: NETunnelProviderManager) throws {
+    private func performSave(_ manager: NETunnelProviderManager) async throws {
         let profileId = manager.profileId
         savedManagers.append(manager)
         record(.save(profileId))
+        if let saveGate {
+            await saveGate.wait()
+        }
         if let profileId, saveFailures.contains(profileId) {
             throw PreferenceFailure.save
         }
@@ -703,6 +812,20 @@ private struct SendableManagers: @unchecked Sendable {
 
     init(_ value: [NETunnelProviderManager]) {
         self.value = value
+    }
+}
+
+// Every policy read/write is protected by this lock, including from Sendable closures.
+private final class MutableProtection: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = NETunnelProtection.disabled
+
+    func read() -> NETunnelProtection {
+        lock.withLock { value }
+    }
+
+    func set(_ policy: NETunnelProtection) {
+        lock.withLock { value = policy }
     }
 }
 

@@ -208,6 +208,18 @@ extension NETunnelStrategy {
         case profileSwitchRequiresDisablingProtection
         case devicePolicyStillRequiresVPN
         case savedConfigurationDoesNotMeetPolicy
+        case policyChangedDuringOperation
+    }
+
+    /// Persist device policy on the same queue as manager changes. All production
+    /// policy writers must use this boundary; a fresh read alone cannot make an
+    /// awaited NetworkExtension save atomic with an unrelated file write.
+    public func withDevicePolicyMutation(
+        _ persist: @escaping @Sendable () throws -> Void
+    ) async throws {
+        try await withMutation { _ in
+            try persist()
+        }
     }
 
     /// Call only after the user explicitly chooses to allow unprotected internet
@@ -218,7 +230,7 @@ extension NETunnelStrategy {
                 throw ProtectionError.devicePolicyStillRequiresVPN
             }
             guard let manager = strategy.allManagers[profileId] else { return }
-            try await strategy.saveManager(manager) {
+            try await strategy.saveManager(manager, expectedProtection: .disabled, allowsProtectionRelease: true) {
                 if let proto = $0.protocolConfiguration as? NETunnelProviderProtocol {
                     var configuration = proto.providerConfiguration ?? [:]
                     configuration.removeValue(forKey: NETunnelProtection.configurationKey)
@@ -235,6 +247,12 @@ extension NETunnelStrategy {
 }
 
 private extension NETunnelStrategy {
+    func requireUnchangedProtection(_ expected: NETunnelProtection) throws {
+        guard try protection() == expected else {
+            throw ProtectionError.policyChangedDuringOperation
+        }
+    }
+
     func isProtected(_ manager: NETunnelProviderManager) throws -> Bool {
         guard let proto = manager.tunnelProtocol else { return false }
         return try NETunnelProtection(protocolConfiguration: proto) == .requireVPN
@@ -306,6 +324,7 @@ private extension NETunnelStrategy {
             if forConnecting {
                 // Reload OS state instead of trusting a marker or cached hash.
                 try await preferences.load(existing)
+                try requireUnchangedProtection(policy)
                 try validateProtectedManager(existing)
                 try existing.connection.startVPNTunnel(options: options)
             }
@@ -322,13 +341,20 @@ private extension NETunnelStrategy {
             }
         }
         let proto = try coder.protocolConfiguration(from: profile)
+        try requireUnchangedProtection(policy)
+        // A coder may read device policy independently. Never overwrite a newly
+        // strict protocol with an older disabled policy captured by this method.
+        if policy == .disabled,
+           try NETunnelProtection(protocolConfiguration: proto) == .requireVPN {
+            throw ProtectionError.policyChangedDuringOperation
+        }
         try policy.apply(to: proto, profile: profile)
 
         // Protection settings are part of the saved configuration identity.
         proto.profileId = profile.id
         proto.fingerprint = configurationFingerprint(profile, protection: policy)
 
-        let manager = try await saveManager(profile.id) {
+        let manager = try await saveManager(profile.id, expectedProtection: policy) {
             $0.localizedDescription = profile.name
             $0.protocolConfiguration = proto
 
@@ -364,6 +390,7 @@ private extension NETunnelStrategy {
 
         // Initiate a connection if requested
         if forConnecting {
+            try requireUnchangedProtection(policy)
             try manager.connection.startVPNTunnel(options: options)
         }
     }
@@ -375,6 +402,7 @@ private extension NETunnelStrategy {
         guard try protection() == .disabled, try !isProtected(manager) else {
             throw ProtectionError.removalRequiresDisablingProtection
         }
+        try requireUnchangedProtection(.disabled)
         try await preferences.remove(manager)
         allManagers.removeValue(forKey: profileId)
     }
@@ -538,21 +566,34 @@ private extension NETunnelStrategy {
 
     func saveManager(
         _ profileId: Profile.ID,
+        expectedProtection: NETunnelProtection,
         block: @escaping @Sendable (NETunnelProviderManager) -> Void
     ) async throws -> NETunnelProviderManager {
-        try await saveManager(allManagers[profileId] ?? NETunnelProviderManager(), block: block)
+        try await saveManager(
+            allManagers[profileId] ?? NETunnelProviderManager(),
+            expectedProtection: expectedProtection,
+            block: block
+        )
     }
 
     @discardableResult
     func saveManager(
         _ manager: NETunnelProviderManager,
+        expectedProtection: NETunnelProtection,
+        allowsProtectionRelease: Bool = false,
         block: @escaping @Sendable (NETunnelProviderManager) -> Void
     ) async throws -> NETunnelProviderManager {
         try await preferences.load(manager)
         try Task.checkCancellation()
+        try requireUnchangedProtection(expectedProtection)
+        if !allowsProtectionRelease, try isProtected(manager) {
+            throw ProtectionError.reconfigurationRequiresDisablingProtection
+        }
         block(manager)
         try Task.checkCancellation()
+        try requireUnchangedProtection(expectedProtection)
         try await preferences.save(manager)
+        try requireUnchangedProtection(expectedProtection)
         return manager
     }
 
@@ -567,12 +608,16 @@ private extension NETunnelStrategy {
     }
 
     func stopManager(_ manager: NETunnelProviderManager) async throws {
-        try await saveManager(manager) {
+        try await saveManager(manager, expectedProtection: .disabled) {
             $0.isOnDemandEnabled = false
         }
         // XXX: Mitigate races where the on-demand flag, despite saveToPreferences(),
         // is not disabled yet, thus causing the tunnel to reconnect.
         try await Task.sleep(for: .milliseconds(200))
+        try requireUnchangedProtection(.disabled)
+        guard try !isProtected(manager) else {
+            throw ProtectionError.disconnectRequiresDisablingProtection
+        }
         manager.connection.stopVPNTunnel()
         await manager.connection.waitForDisconnection()
     }
