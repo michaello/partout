@@ -26,6 +26,45 @@ struct NEProtocolCoderTests {
         #expect(try sut.profile(from: proto) == profile)
     }
 
+#if !os(tvOS)
+    @available(macOS 26, iOS 26, *)
+    @Test(arguments: CoderKind.allCases)
+    func strictCodersOverrideProfileBypassesAndSavePolicy(_ kind: CoderKind) throws {
+        let profile = try strictProfile()
+        let (sut, _) = try makeCoder(kind, containing: profile, protection: { .requireVPN })
+        let proto = try sut.protocolConfiguration(from: profile)
+
+        #expect(try NETunnelProtection(protocolConfiguration: proto) == .requireVPN)
+        #expect(proto.disconnectOnSleep == false)
+#if !os(tvOS)
+        #expect(proto.includeAllNetworks)
+        #expect(proto.excludeLocalNetworks == false)
+        if #available(macOS 13.3, iOS 16.4, *) {
+            #expect(proto.excludeAPNs == false)
+            #expect(proto.excludeCellularServices == false)
+        }
+        if #available(macOS 14.4, iOS 17.4, *) {
+            #expect(proto.excludeDeviceCommunication == false)
+        }
+#endif
+        #expect(try sut.profile(from: proto) == profile)
+    }
+
+#endif
+
+    @Test(arguments: CoderKind.allCases)
+    func policyReadFailurePropagatesBeforeCredentialAccess(_ kind: CoderKind) throws {
+        let profile = try strictProfile()
+        let (sut, keychain) = try makeCoder(kind, containing: profile, protection: {
+            throw NETunnelProtectionError.invalidConfiguration
+        })
+        #expect(throws: NETunnelProtectionError.invalidConfiguration) {
+            try sut.protocolConfiguration(from: profile)
+        }
+        #expect(keychain.referenceLookups.isEmpty)
+        #expect(keychain.setCalls.isEmpty)
+    }
+
     @Test(arguments: CoderKind.allCases)
     func malformedProtocolIsRejected(_ kind: CoderKind) throws {
         let profile = try newProfile()
@@ -110,7 +149,8 @@ private extension NEProtocolCoderTests {
 
     func makeCoder(
         _ kind: CoderKind,
-        containing profile: Profile
+        containing profile: Profile,
+        protection: @escaping @Sendable () throws -> NETunnelProtection = { .disabled }
     ) throws -> (any NEProtocolCoder, MockKeychain) {
         let coder = BasicProfileCoder()
         let encoded = try coder.string(fromProfile: profile)
@@ -123,7 +163,8 @@ private extension NEProtocolCoderTests {
                     .global,
                     tunnelBundleIdentifier: bundleIdentifier,
                     coder: coder,
-                    uid: 100
+                    uid: 100,
+                    protection: protection
                 ),
                 keychain
             )
@@ -133,11 +174,24 @@ private extension NEProtocolCoderTests {
                     .global,
                     tunnelBundleIdentifier: bundleIdentifier,
                     coder: coder,
-                    keychain: keychain
+                    keychain: keychain,
+                    protection: protection
                 ),
                 keychain
             )
         }
+    }
+
+    func strictProfile() throws -> Profile {
+        var builder = Profile.Builder(
+            modules: [OpenVPNModule(
+                id: UniqueID(),
+                configuration: OpenVPNConfiguration(remotes: [try ExtendedEndpoint("192.0.2.1", .init(.udp, 1194))])
+            )],
+            activatingModules: true
+        )
+        builder.behavior = ProfileBehavior(disconnectsOnSleep: true, includesAllNetworks: false)
+        return try builder.build()
     }
 
     func newProfile() throws -> Profile {

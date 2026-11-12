@@ -12,17 +12,21 @@ public struct ProviderNEProtocolCoder: NEProtocolCoder {
 
     private let coder: ProfileCoder
 
+    private let protection: @Sendable () throws -> NETunnelProtection
+
     private let uid: Int
 
     public init(
         _ ctx: PartoutLoggerContext,
         tunnelBundleIdentifier: String,
         coder: ProfileCoder,
-        uid: Int
+        uid: Int,
+        protection: @escaping @Sendable () throws -> NETunnelProtection = { .disabled }
     ) {
         self.ctx = ctx
         self.tunnelBundleIdentifier = tunnelBundleIdentifier
         self.coder = coder
+        self.protection = protection
         self.uid = uid
     }
 
@@ -34,6 +38,8 @@ public struct ProviderNEProtocolCoder: NEProtocolCoder {
     }
 
     public func protocolConfiguration(from profile: Profile) throws -> NETunnelProviderProtocol {
+        let protection = try protection()
+        try protection.validate(profile)
         let encoded = try coder.string(fromProfile: profile)
 
         let proto = NETunnelProviderProtocol()
@@ -43,10 +49,7 @@ public struct ProviderNEProtocolCoder: NEProtocolCoder {
             Self.uidKey: uid
         ]
         proto.serverAddress = NEProtocolCoderServerAddress
-        proto.disconnectOnSleep = profile.disconnectsOnSleep
-#if !os(tvOS)
-        proto.includeAllNetworks = profile.includesAllNetworks
-#endif
+        try protection.apply(to: proto, profile: profile)
         return proto
     }
 

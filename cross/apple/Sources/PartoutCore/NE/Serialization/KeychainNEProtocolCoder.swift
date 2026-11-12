@@ -20,6 +20,8 @@ public struct KeychainNEProtocolCoder: NEProtocolCoder {
 
     private let coder: ProfileCoder
 
+    private let protection: @Sendable () throws -> NETunnelProtection
+
     private let keychain: Keychain
 
     private let legacyOptions: LegacyOptions?
@@ -29,11 +31,13 @@ public struct KeychainNEProtocolCoder: NEProtocolCoder {
         tunnelBundleIdentifier: String,
         coder: ProfileCoder,
         keychain: Keychain,
-        legacyOptions: LegacyOptions? = nil
+        legacyOptions: LegacyOptions? = nil,
+        protection: @escaping @Sendable () throws -> NETunnelProtection = { .disabled }
     ) {
         self.ctx = ctx
         self.tunnelBundleIdentifier = tunnelBundleIdentifier
         self.coder = coder
+        self.protection = protection
         self.keychain = keychain
         self.legacyOptions = legacyOptions
     }
@@ -53,6 +57,8 @@ public struct KeychainNEProtocolCoder: NEProtocolCoder {
     }
 
     public func protocolConfiguration(from profile: Profile) throws -> NETunnelProviderProtocol {
+        let protection = try protection()
+        try protection.validate(profile)
         let passwordReference: Data
 
         // Legacy had side-effect, actively writes to keychain
@@ -74,10 +80,7 @@ public struct KeychainNEProtocolCoder: NEProtocolCoder {
         proto.providerBundleIdentifier = tunnelBundleIdentifier
         proto.serverAddress = NEProtocolCoderServerAddress
         proto.passwordReference = passwordReference
-        proto.disconnectOnSleep = profile.disconnectsOnSleep
-#if !os(tvOS)
-        proto.includeAllNetworks = profile.includesAllNetworks
-#endif
+        try protection.apply(to: proto, profile: profile)
         return proto
     }
 

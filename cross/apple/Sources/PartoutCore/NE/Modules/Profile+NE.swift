@@ -22,6 +22,30 @@ extension Profile {
         with info: TunnelRemoteInfoWrapper?,
         options: TunnelControllerOptions = .init()
     ) -> NEPacketTunnelNetworkSettings {
+        makeNetworkSettings(with: info, options: options, allowsDNSFallback: true)
+    }
+
+    /// Validates the effective settings after local and server-provided modules are combined.
+    /// Requiring both default routes deliberately rejects profiles with an unsupported IP family.
+    public func protectedNetworkSettings(
+        with info: TunnelRemoteInfoWrapper?,
+        options: TunnelControllerOptions = .init()
+    ) throws -> NEPacketTunnelNetworkSettings {
+        try NETunnelProtection.requireVPN.validate(self)
+        let effectiveModules = activeModules + (info?.modules?.map(\.containedModule) ?? [])
+        guard !effectiveModules.contains(where: { ($0 as? DNSModule)?.routesThroughVPN == false }) else {
+            throw NETunnelProtectionError.dnsOutsideTunnel
+        }
+        let settings = makeNetworkSettings(with: info, options: options, allowsDNSFallback: false)
+        try NETunnelProtection.requireVPN.validate(settings)
+        return settings
+    }
+
+    private func makeNetworkSettings(
+        with info: TunnelRemoteInfoWrapper?,
+        options: TunnelControllerOptions,
+        allowsDNSFallback: Bool
+    ) -> NEPacketTunnelNetworkSettings {
         let ctx = PartoutLoggerContext(id)
         let tunnelRemoteAddress = info?.address?.rawValue ?? NEPacketTunnelNetworkSettings.fakeRemoteAddress
         var neSettings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: tunnelRemoteAddress)
@@ -85,7 +109,7 @@ extension Profile {
 
         // 5. Optionally enable DNS fallback if default gateway without DNS settings
 
-        if isGateway, neSettings.dnsSettings == nil {
+        if allowsDNSFallback, isGateway, neSettings.dnsSettings == nil {
             pp_log(ctx, .os, .info, "\tVPN is default gateway but has no DNS settings")
 
             let dnsFallbackServers = options.dnsFallbackServers
