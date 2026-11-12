@@ -207,6 +207,7 @@ extension NETunnelStrategy {
         case reconfigurationRequiresDisablingProtection
         case profileSwitchRequiresDisablingProtection
         case devicePolicyStillRequiresVPN
+        case savedConfigurationDoesNotMeetPolicy
     }
 
     /// Call only after the user explicitly chooses to allow unprotected internet
@@ -244,6 +245,35 @@ private extension NETunnelStrategy {
         return protection == .requireVPN ? value + ":Partout.RequireVPN:v1" : value
     }
 
+    func validateProtectedManager(_ manager: NETunnelProviderManager) throws {
+#if os(tvOS)
+        throw NETunnelProtectionError.unsupportedPlatform
+#else
+        guard #available(macOS 26, iOS 26, *) else {
+            throw NETunnelProtectionError.unsupportedPlatform
+        }
+        guard let proto = manager.tunnelProtocol,
+              try NETunnelProtection(protocolConfiguration: proto) == .requireVPN,
+              proto.includeAllNetworks,
+              !proto.disconnectOnSleep,
+              !proto.excludeLocalNetworks,
+              !proto.excludeAPNs,
+              !proto.excludeCellularServices,
+              !proto.excludeDeviceCommunication,
+              manager.isEnabled,
+              manager.isOnDemandEnabled,
+              let rules = manager.onDemandRules, rules.count == 1,
+              let rule = rules.first as? NEOnDemandRuleConnect,
+              rule.interfaceTypeMatch == .any,
+              rule.dnsSearchDomainMatch == nil,
+              rule.dnsServerAddressMatch == nil,
+              rule.ssidMatch == nil,
+              rule.probeURL == nil else {
+            throw ProtectionError.savedConfigurationDoesNotMeetPolicy
+        }
+#endif
+    }
+
     func validateConnectionTransition(to profileId: Profile.ID, protection: NETunnelProtection) throws {
         for (currentId, manager) in allManagers {
             let protected = try isProtected(manager)
@@ -274,6 +304,9 @@ private extension NETunnelStrategy {
                 throw ProtectionError.reconfigurationRequiresDisablingProtection
             }
             if forConnecting {
+                // Reload OS state instead of trusting a marker or cached hash.
+                try await preferences.load(existing)
+                try validateProtectedManager(existing)
                 try existing.connection.startVPNTunnel(options: options)
             }
             return

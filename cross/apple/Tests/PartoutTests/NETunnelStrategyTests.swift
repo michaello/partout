@@ -199,6 +199,71 @@ struct NETunnelStrategyProtectionTests {
         #expect(try NETunnelProtection(protocolConfiguration: proto) == .disabled)
     }
 
+    @Test(arguments: [
+        "includeAllNetworks", "disconnectOnSleep", "excludeLocalNetworks", "excludeAPNs",
+        "excludeCellularServices", "excludeDeviceCommunication", "isEnabled", "isOnDemandEnabled",
+        "disconnectRule", "interface", "ssid", "dnsSearchDomain", "dnsServer", "probeURL"
+    ])
+    func strictReconnectRejectsWeakenedSavedConfiguration(_ setting: String) async throws {
+        guard #available(macOS 26, iOS 26, *) else { return }
+        let profile = try protectedProfile()
+        let manager = makeManager(
+            profileId: profile.id,
+            fingerprint: profile.name + ":Partout.RequireVPN:v1",
+            status: .disconnected,
+            isOnDemandEnabled: true,
+            protection: .requireVPN
+        )
+        let proto = try #require(manager.protocolConfiguration as? NETunnelProviderProtocol)
+        let rule = try #require(manager.onDemandRules?.first)
+#if !os(tvOS)
+        switch setting {
+        case "includeAllNetworks": proto.includeAllNetworks = false
+        case "disconnectOnSleep": proto.disconnectOnSleep = true
+        case "excludeLocalNetworks": proto.excludeLocalNetworks = true
+        case "excludeAPNs": proto.excludeAPNs = true
+        case "excludeCellularServices": proto.excludeCellularServices = true
+        case "excludeDeviceCommunication": proto.excludeDeviceCommunication = true
+        case "isEnabled": manager.isEnabled = false
+        case "isOnDemandEnabled": manager.isOnDemandEnabled = false
+        case "disconnectRule": manager.onDemandRules = [NEOnDemandRuleDisconnect()]
+        case "interface": rule.interfaceTypeMatch = .wiFi
+        case "ssid": rule.ssidMatch = ["Trusted Wi-Fi"]
+        case "dnsSearchDomain": rule.dnsSearchDomainMatch = ["example.test"]
+        case "dnsServer": rule.dnsServerAddressMatch = ["192.0.2.53"]
+        case "probeURL": rule.probeURL = URL(string: "https://example.test/probe")
+        default: Issue.record("Unknown weakening")
+        }
+        manager.protocolConfiguration = proto
+        if !["disconnectRule"].contains(setting) {
+            manager.onDemandRules = [rule]
+        }
+#endif
+        let store = MockTunnelPreferences(managers: [manager])
+        let strategy = try await makePreparedStrategy(profile: profile, store: store, protection: { .requireVPN })
+        await #expect(throws: NETunnelStrategy.ProtectionError.savedConfigurationDoesNotMeetPolicy) {
+            try await strategy.install(profile, connect: true, options: nil)
+        }
+        #expect(await store.savedManagers.isEmpty)
+        #expect(await store.actions == [.loadAll, .load(profile.id)])
+    }
+
+    @Test
+    func strictReconnectReloadsAndRetainsVerifiedConfiguration() async throws {
+        let profile = try protectedProfile()
+        let store = MockTunnelPreferences(managers: [makeManager(
+            profileId: profile.id,
+            fingerprint: profile.name + ":Partout.RequireVPN:v1",
+            status: .disconnected,
+            isOnDemandEnabled: true,
+            protection: .requireVPN
+        )])
+        let strategy = try await makePreparedStrategy(profile: profile, store: store, protection: { .requireVPN })
+        try await strategy.install(profile, connect: true, options: nil)
+        #expect(await store.savedManagers.isEmpty)
+        #expect(await store.actions == [.loadAll, .load(profile.id)])
+    }
+
     @Test
     func sourceSnapshotCannotForgetProtectedManagerDeletedFromProfiles() async throws {
         let profile = try protectedProfile()
@@ -694,6 +759,23 @@ private func makeManager(
     let manager = status.map(TestTunnelProviderManager.init) ?? NETunnelProviderManager()
     manager.protocolConfiguration = proto
     manager.isOnDemandEnabled = isOnDemandEnabled
+    if protection == .requireVPN {
+#if !os(tvOS)
+        proto.includeAllNetworks = true
+        proto.disconnectOnSleep = false
+        proto.excludeLocalNetworks = false
+        if #available(macOS 13.3, iOS 16.4, *) {
+            proto.excludeAPNs = false
+            proto.excludeCellularServices = false
+        }
+        if #available(macOS 14.4, iOS 17.4, *) {
+            proto.excludeDeviceCommunication = false
+        }
+        manager.protocolConfiguration = proto
+#endif
+        manager.isEnabled = true
+        manager.onDemandRules = [NEOnDemandRuleConnect()]
+    }
     return manager
 }
 
