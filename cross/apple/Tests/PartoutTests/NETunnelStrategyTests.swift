@@ -147,6 +147,39 @@ struct NETunnelStrategyContractTests {
 }
 
 struct NETunnelStrategyProtectionTests {
+    @Test(arguments: ["fingerprint", "profileId", "providerBundleIdentifier"])
+    func reconnectRechecksLoadedConfigurationIdentity(_ field: String) async throws {
+        let profile = try protectedProfile()
+        let manager = makeManager(
+            profileId: profile.id,
+            fingerprint: profile.name + ":Partout.RequireVPN:v1",
+            status: .disconnected,
+            isOnDemandEnabled: true,
+            protection: .requireVPN
+        )
+        let store = MockTunnelPreferences(managers: [manager], loadMutation: { manager in
+            guard let proto = manager.protocolConfiguration as? NETunnelProviderProtocol else { return }
+            switch field {
+            case "fingerprint":
+                proto.providerConfiguration?[fingerprintKey] = "Changed:Partout.RequireVPN:v1"
+            case "profileId":
+                proto.providerConfiguration?[profileIdKey] = Profile.ID().uuidString
+            case "providerBundleIdentifier":
+                proto.providerBundleIdentifier = "com.example.other.PacketTunnel"
+            default:
+                Issue.record("Unknown identity field")
+            }
+            manager.protocolConfiguration = proto
+        })
+        let strategy = try await makePreparedStrategy(profile: profile, store: store, protection: { .requireVPN })
+        await #expect(throws: NETunnelStrategy.ProtectionError.reconfigurationRequiresDisablingProtection) {
+            try await strategy.install(profile, connect: true, options: nil)
+        }
+        #expect((manager.connection as? TestVPNConnection)?.startCount == 0)
+        #expect(await store.actions == [.loadAll, .load(profile.id)])
+        #expect(await store.savedManagers.isEmpty)
+    }
+
     @Test(arguments: [NETunnelProtection.requireVPN.rawValue, "corrupt"])
     func removalReloadsSavedProtectionBeforeDeleting(_ marker: String) async throws {
         let profile = try protectedProfile()
@@ -407,15 +440,17 @@ struct NETunnelStrategyProtectionTests {
     @Test
     func strictReconnectReloadsAndRetainsVerifiedConfiguration() async throws {
         let profile = try protectedProfile()
-        let store = MockTunnelPreferences(managers: [makeManager(
+        let manager = makeManager(
             profileId: profile.id,
             fingerprint: profile.name + ":Partout.RequireVPN:v1",
             status: .disconnected,
             isOnDemandEnabled: true,
             protection: .requireVPN
-        )])
+        )
+        let store = MockTunnelPreferences(managers: [manager])
         let strategy = try await makePreparedStrategy(profile: profile, store: store, protection: { .requireVPN })
         try await strategy.install(profile, connect: true, options: nil)
+        #expect((manager.connection as? TestVPNConnection)?.startCount == 1)
         #expect(await store.savedManagers.isEmpty)
         #expect(await store.actions == [.loadAll, .load(profile.id)])
     }
@@ -759,6 +794,7 @@ private actor MockTunnelPreferences {
     private let managers: [NETunnelProviderManager]
     private let isEnabledOnLoad: Bool?
     private let protectionMarkerOnLoad: String?
+    private let loadMutation: (@Sendable (NETunnelProviderManager) -> Void)?
     private let loadAllGate: PreferenceGate?
     private let loadGate: PreferenceGate?
     private let saveGate: PreferenceGate?
@@ -773,6 +809,7 @@ private actor MockTunnelPreferences {
         managers: [NETunnelProviderManager] = [],
         isEnabledOnLoad: Bool? = nil,
         protectionMarkerOnLoad: String? = nil,
+        loadMutation: (@Sendable (NETunnelProviderManager) -> Void)? = nil,
         loadAllGate: PreferenceGate? = nil,
         loadGate: PreferenceGate? = nil,
         saveGate: PreferenceGate? = nil,
@@ -782,6 +819,7 @@ private actor MockTunnelPreferences {
         self.managers = managers
         self.isEnabledOnLoad = isEnabledOnLoad
         self.protectionMarkerOnLoad = protectionMarkerOnLoad
+        self.loadMutation = loadMutation
         self.loadAllGate = loadAllGate
         self.loadGate = loadGate
         self.saveGate = saveGate
@@ -840,6 +878,7 @@ private actor MockTunnelPreferences {
             proto.providerConfiguration = configuration
             manager.protocolConfiguration = proto
         }
+        loadMutation?(manager)
     }
 
     private func performSave(_ manager: NETunnelProviderManager) async throws {
@@ -987,6 +1026,8 @@ private final class TestTunnelProviderManager: NETunnelProviderManager {
 private final class TestVPNConnection: NEVPNConnection {
     private let testStatus: NEVPNStatus
 
+    private(set) var startCount = 0
+
     init(status: NEVPNStatus) {
         testStatus = status
         super.init()
@@ -996,7 +1037,9 @@ private final class TestVPNConnection: NEVPNConnection {
         testStatus
     }
 
-    override func startVPNTunnel(options: [String: NSObject]? = nil) throws {}
+    override func startVPNTunnel(options: [String: NSObject]? = nil) throws {
+        startCount += 1
+    }
 
     override func stopVPNTunnel() {}
 }

@@ -325,6 +325,11 @@ private extension NETunnelStrategy {
                 // Reload OS state instead of trusting a marker or cached hash.
                 try await preferences.load(existing)
                 try requireUnchangedProtection(policy)
+                guard existing.tunnelProtocol?.profileId == profile.id,
+                      existing.tunnelProtocol?.providerBundleIdentifier == bundleIdentifier,
+                      existing.fingerprint == expectedFingerprint else {
+                    throw ProtectionError.reconfigurationRequiresDisablingProtection
+                }
                 try validateProtectedManager(existing)
                 try existing.connection.startVPNTunnel(options: options)
             }
